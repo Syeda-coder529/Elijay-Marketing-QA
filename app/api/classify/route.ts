@@ -3,19 +3,20 @@ import { getSession } from "@/lib/session";
 import { readAllCalls, updateCall } from "@/lib/store";
 import { classifyCallWithGemini } from "@/lib/gemini";
 import { syncCallsToSheets } from "@/lib/sheets";
+import { parseDurationToSeconds } from "@/lib/duration";
 import type { CallRecord } from "@/lib/types";
 
-// Long calls need the full time budget for a single call — Vercel Hobby
-// allows up to 300s (2026 limits), so we use nearly all of it here since
-// only ONE call is processed per invocation.
-export const maxDuration = 300;
+// Vercel Hobby now allows up to 300s (as of 2026), so we have room. We still
+// keep this well under the limit for safety margin against Gemini variance.
+export const maxDuration = 120;
 
-// Calls at or under this are handled by the fast /api/classify route instead.
+// Only calls at or under this duration (seconds) are auto-classified here.
+// Longer calls are handled one at a time by /api/classify-long instead.
 const MAX_CALL_DURATION_SECONDS = 40;
 
-// Leave a small safety margin below maxDuration so we always get a chance
-// to write the result + respond before Vercel kills the function.
-const PER_CALL_TIMEOUT_MS = 280000; // 280s
+// Per-Gemini-call timeout so one stuck/slow call can't hang the whole batch
+// and take the rest of the pending records down with it.
+const PER_CALL_TIMEOUT_MS = 20000;
 
 function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
   return Promise.race([
@@ -26,9 +27,9 @@ function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
   ]);
 }
 
-// Classifies ONE long (>40s) PENDING call per invocation. Admin-only.
-// The dashboard should loop this endpoint (like it already loops
-// /api/classify) until `remaining` is 0.
+// Classifies PENDING short calls (<=40s) in batches (or a single call if
+// `id` is provided). Admin-only. The dashboard calls this endpoint in a loop
+// (see app/admin/dashboard/page.tsx) until `remaining` is 0.
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session || session.role !== "admin") {
@@ -44,37 +45,33 @@ export async function POST(req: NextRequest) {
     ? all.filter((c) => c.id === singleId)
     : all.filter((c) => c.qaResult === "PENDING");
 
-  // Only long calls here — the ones the fast route skips.
+  // Duration filter: skip long calls here so a slow transcription doesn't
+  // eat the whole batch's time budget. Long calls are picked up by
+  // /api/classify-long instead.
   const targets = singleId
     ? pending
-    : pending.filter((c) => (c.duration ?? 0) > MAX_CALL_DURATION_SECONDS);
+    : pending.filter((c) => parseDurationToSeconds(c.duration) <= MAX_CALL_DURATION_SECONDS);
 
-  // Always exactly one at a time for long calls.
-  const call = targets[0];
-
-  if (!call) {
-    return NextResponse.json({
-      ok: true,
-      processed: 0,
-      remaining: 0,
-      results: [],
-      sync: { synced: false, reason: "Nothing to process" }
-    });
-  }
+  // Smaller batch = more safety margin against per-call latency variance.
+  const MAX_PER_RUN = singleId ? 1 : 4;
+  const batch = targets.slice(0, MAX_PER_RUN);
 
   const results: { id: string; ok: boolean; error?: string }[] = [];
 
-  try {
-    const classification = await classifyWithTimeout(call);
-    await updateCall(call.id, {
-      qaResult: classification.result,
-      qaReason: classification.reason,
-      qaScore: classification.score,
-      qaTranscript: classification.transcript
-    });
-    results.push({ id: call.id, ok: true });
-  } catch (e: any) {
-    results.push({ id: call.id, ok: false, error: e.message });
+  for (const call of batch) {
+    try {
+      const classification = await classifyWithTimeout(call);
+      await updateCall(call.id, {
+        qaResult: classification.result,
+        qaReason: classification.reason,
+        qaScore: classification.score,
+        qaTranscript: classification.transcript
+      });
+      results.push({ id: call.id, ok: true });
+    } catch (e: any) {
+      results.push({ id: call.id, ok: false, error: e.message });
+      // One failed/timed-out call no longer blocks the rest of the batch.
+    }
   }
 
   const updatedAll = await readAllCalls();
@@ -83,7 +80,10 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({
     ok: true,
     processed: results.length,
-    remaining: Math.max(0, targets.length - 1),
+    remaining: Math.max(0, targets.length - batch.length),
+    // How many PENDING calls exist but are over the duration cutoff and
+    // therefore not being touched by this run (handled by classify-long).
+    skippedLongCalls: singleId ? 0 : pending.length - targets.length,
     results,
     sync
   });
