@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI, createUserContent, createPartFromBase64 } from "@google/genai";
 import { CallRecord, QAResult } from "./types";
 
 const VALID_RESULTS: QAResult[] = [
@@ -24,8 +24,7 @@ export interface QAClassification {
 // capped by Gemini's request size limit; a very long recording (roughly a
 // 30+ minute call at typical compressed bitrates) may exceed it. If you
 // start hitting size errors on longer calls, switch to the Gemini Files API
-// (genAI.fileManager / uploadFile) instead of inline data — that's a
-// straightforward follow-up but out of scope for this pass.
+// (ai.files.upload) instead of inline data.
 const MAX_INLINE_BYTES = 19 * 1024 * 1024; // stay under Gemini's ~20MB request cap
 
 function guessMimeType(url: string, contentType: string | null): string {
@@ -69,9 +68,16 @@ async function fetchAudioAsBase64(url: string): Promise<{ data: string; mimeType
   };
 }
 
+// gemini-2.5-flash was retired for new users in 2026 — gemini-3.6-flash is
+// the current stable Flash-tier model as of this writing. Google's model
+// lineup changes often; if this ever starts returning a "model not found"
+// error, check https://ai.google.dev/gemini-api/docs/models for the current
+// recommended replacement and swap the string below.
+const MODEL_NAME = "gemini-3.6-flash";
+
 /**
- * Classifies a single call by having Gemini 2.5 Flash listen to its
- * recording directly (transcription + classification in one pass).
+ * Classifies a single call by having Gemini listen to its recording
+ * directly (transcription + classification in one pass).
  * Requires GEMINI_API_KEY to be set in the environment.
  */
 export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassification> {
@@ -94,13 +100,7 @@ export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassi
     return { result: "SHORT CALL", reason: e.message || "Could not load recording.", score: 0, transcript: "" };
   }
 
-  // gemini-1.5-flash was retired by Google in 2026 — gemini-2.5-flash is the
-  // current Flash-tier model with a free, no-credit-card tier. Google's
-  // model lineup changes often; if this ever starts returning a
-  // "model not found" error, check https://ai.google.dev/gemini-api/docs/models
-  // for the current recommended replacement.
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const ai = new GoogleGenAI({ apiKey });
 
   const prompt = `You are a strict call-center QA analyst for a pay-per-call marketing company.
 Listen to the attached call recording. First transcribe it (best effort — it's fine to note
@@ -122,12 +122,15 @@ Duration: ${call.duration || "unknown"}
 Respond with ONLY minified JSON, no markdown, no code fences, in exactly this shape:
 {"transcript":"<the transcript you produced>","result":"<one of the categories above>","reason":"<one sentence reason>","score":<integer 0-100 call quality score>}`;
 
-  const response = await model.generateContent([
-    { inlineData: { mimeType: audio.mimeType, data: audio.data } },
-    prompt
-  ]);
+  const response = await ai.models.generateContent({
+    model: MODEL_NAME,
+    contents: createUserContent([
+      createPartFromBase64(audio.data, audio.mimeType),
+      prompt
+    ])
+  });
 
-  const text = response.response.text().trim();
+  const text = (response.text || "").trim();
   const cleaned = text.replace(/```json|```/g, "").trim();
 
   try {
