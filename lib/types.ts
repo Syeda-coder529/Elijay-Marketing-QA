@@ -27,6 +27,8 @@ export interface CallRecord {
   qaReason: string;
   qaScore: number | null;
   qaTranscript: string; // transcript Gemini produced while listening to `recording`
+  qaAttempts?: number;  // how many times we've tried to classify this call
+  qaError?: string;     // last error message, for calls stuck after retries
 }
 
 export type Role = "admin" | "publisher" | "buyer";
