@@ -1,14 +1,18 @@
 import { CallRecord, QAResult } from "./types";
 
 // ---------------------------------------------------------------------------
-// Switched from Gemini to Groq (free tier) — Gemini's free daily quota for
-// gemini-3.6-flash was only 20 requests/day, nowhere near enough for a batch
+// Uses Groq (free tier) instead of Gemini — Gemini's free daily quota was
+// only 20 requests/day for gemini-3.6-flash, nowhere near enough for a batch
 // of 90+ calls. Groq's free tier gives ~2,000 audio transcriptions/day
-// (Whisper) and ~14,400 text requests/day (Llama), with no credit card
-// required. This does the job in two steps instead of Gemini's one:
+// (Whisper) and ~14,400 text requests/day (Llama), no credit card required.
+// Two steps instead of Gemini's one:
 //   1. Whisper transcribes the recording audio -> text
 //   2. Llama reads the transcript and classifies it -> QA result
 // Requires GROQ_API_KEY in the environment.
+//
+// Ringba's recording URLs (recording-public?v=v1&k=...) have no file
+// extension at all, so the real audio format is detected from the HTTP
+// response's Content-Type header instead of guessing from the URL.
 // ---------------------------------------------------------------------------
 
 const VALID_RESULTS: QAResult[] = [
@@ -32,25 +36,61 @@ const MAX_AUDIO_BYTES = 24 * 1024 * 1024; // Groq's free-tier upload cap is 25MB
 const WHISPER_MODEL = "whisper-large-v3-turbo"; // fast + free; use "whisper-large-v3" for max accuracy
 const LLAMA_MODEL = "llama-3.3-70b-versatile";
 
-function guessMimeType(url: string, contentType: string | null): string {
-  if (contentType && contentType.startsWith("audio/")) return contentType;
-  const ext = url.split("?")[0].split(".").pop()?.toLowerCase();
-  switch (ext) {
-    case "mp3":
-      return "audio/mp3";
-    case "wav":
-      return "audio/wav";
-    case "ogg":
-      return "audio/ogg";
-    case "m4a":
-      return "audio/mp4";
-    case "flac":
-      return "audio/flac";
-    case "aac":
-      return "audio/aac";
-    default:
-      return "audio/mpeg";
-  }
+const SUPPORTED_EXTENSIONS = new Set([
+  "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "opus", "wav", "webm"
+]);
+
+// Maps a Content-Type header to a Groq-supported file extension. This is
+// the reliable path for URLs like Ringba's recording-public endpoint, which
+// have no file extension in the URL itself — only the actual HTTP response
+// headers tell us the real format.
+function extensionFromContentType(contentType: string | null): string | null {
+  if (!contentType) return null;
+  const type = contentType.split(";")[0].trim().toLowerCase();
+  const map: Record<string, string> = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/ogg": "ogg",
+    "audio/opus": "opus",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/webm": "webm",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac"
+  };
+  return map[type] || null;
+}
+
+// Fallback for when Content-Type is missing/unhelpful: try the URL's own
+// extension, then finally default to mp3 (the most common call-recording
+// format) rather than sending something Groq will reject outright.
+function guessFileExtension(url: string, contentType: string | null): string {
+  const fromHeader = extensionFromContentType(contentType);
+  if (fromHeader) return fromHeader;
+
+  const fromUrl = url.split("?")[0].split(".").pop()?.toLowerCase();
+  if (fromUrl && SUPPORTED_EXTENSIONS.has(fromUrl)) return fromUrl;
+
+  return "mp3";
+}
+
+function mimeTypeForExtension(ext: string): string {
+  const map: Record<string, string> = {
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    opus: "audio/opus",
+    m4a: "audio/mp4",
+    webm: "audio/webm",
+    flac: "audio/flac",
+    mp4: "audio/mp4",
+    mpeg: "audio/mpeg",
+    mpga: "audio/mpeg"
+  };
+  return map[ext] || "audio/mpeg";
 }
 
 async function fetchAudioBuffer(url: string): Promise<{ buffer: Buffer; mimeType: string; ext: string }> {
@@ -67,8 +107,8 @@ async function fetchAudioBuffer(url: string): Promise<{ buffer: Buffer; mimeType
     throw new Error("Recording file is too large for AI review (over ~24MB).");
   }
 
-  const mimeType = guessMimeType(url, res.headers.get("content-type"));
-  const ext = url.split("?")[0].split(".").pop()?.toLowerCase() || "mp3";
+  const ext = guessFileExtension(url, res.headers.get("content-type"));
+  const mimeType = mimeTypeForExtension(ext);
   return { buffer, mimeType, ext };
 }
 
