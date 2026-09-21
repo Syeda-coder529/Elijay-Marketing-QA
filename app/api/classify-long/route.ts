@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/session";
 import { readAllCalls, updateCall } from "@/lib/store";
 import { classifyCallWithGemini } from "@/lib/gemini";
-import { syncCallsToSheets } from "@/lib/sheets";
 import { parseDurationToSeconds } from "@/lib/duration";
 import type { CallRecord } from "@/lib/types";
 
@@ -18,6 +17,8 @@ const MAX_CALL_DURATION_SECONDS = 40;
 // to write the result + respond before Vercel kills the function.
 const PER_CALL_TIMEOUT_MS = 280000; // 280s
 
+const MAX_ATTEMPTS = 3;
+
 function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
   return Promise.race([
     classifyCallWithGemini(call),
@@ -29,7 +30,8 @@ function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
 
 // Classifies ONE long (>40s) PENDING call per invocation. Admin-only.
 // The dashboard loops this endpoint (like it already loops /api/classify)
-// until `remaining` is 0.
+// until `remaining` is 0. Google Sheets sync is NOT done here — call
+// /api/sync once after the full run instead.
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session || session.role !== "admin") {
@@ -43,7 +45,7 @@ export async function POST(req: NextRequest) {
 
   const pending = singleId
     ? all.filter((c) => c.id === singleId)
-    : all.filter((c) => c.qaResult === "PENDING");
+    : all.filter((c) => c.qaResult === "PENDING" && (c.qaAttempts ?? 0) < MAX_ATTEMPTS);
 
   // Only long calls here — the ones the fast route skips.
   const targets = singleId
@@ -57,13 +59,15 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       processed: 0,
+      failed: 0,
       remaining: 0,
-      results: [],
-      sync: { synced: false, reason: "Nothing to process" }
+      results: []
     });
   }
 
   const results: { id: string; ok: boolean; error?: string }[] = [];
+  let successCount = 0;
+  let failCount = 0;
 
   try {
     const classification = await classifyWithTimeout(call);
@@ -71,21 +75,23 @@ export async function POST(req: NextRequest) {
       qaResult: classification.result,
       qaReason: classification.reason,
       qaScore: classification.score,
-      qaTranscript: classification.transcript
+      qaTranscript: classification.transcript,
+      qaError: undefined
     });
     results.push({ id: call.id, ok: true });
+    successCount = 1;
   } catch (e: any) {
+    const attempts = (call.qaAttempts ?? 0) + 1;
+    await updateCall(call.id, { qaAttempts: attempts, qaError: e.message });
     results.push({ id: call.id, ok: false, error: e.message });
+    failCount = 1;
   }
-
-  const updatedAll = await readAllCalls();
-  const sync = await syncCallsToSheets(updatedAll).catch((e) => ({ synced: false, reason: e.message }));
 
   return NextResponse.json({
     ok: true,
-    processed: results.length,
+    processed: successCount,
+    failed: failCount,
     remaining: Math.max(0, targets.length - 1),
-    results,
-    sync
+    results
   });
 }
