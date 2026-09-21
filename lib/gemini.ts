@@ -73,7 +73,7 @@ async function fetchAudioAsBase64(url: string): Promise<{ data: string; mimeType
 // lineup changes often; if this ever starts returning a "model not found"
 // error, check https://ai.google.dev/gemini-api/docs/models for the current
 // recommended replacement and swap the string below.
-const MODEL_NAME = "gemini-3.6-flash";
+const MODEL_NAME = "gemini-2.5-flash-lite";
 
 /**
  * Classifies a single call by having Gemini listen to its recording
