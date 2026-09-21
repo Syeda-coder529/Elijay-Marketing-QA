@@ -1,18 +1,8 @@
 import { CallRecord, QAResult } from "./types";
 
 // ---------------------------------------------------------------------------
-// Uses Groq (free tier) instead of Gemini — Gemini's free daily quota was
-// only 20 requests/day for gemini-3.6-flash, nowhere near enough for a batch
-// of 90+ calls. Groq's free tier gives ~2,000 audio transcriptions/day
-// (Whisper) and ~14,400 text requests/day (Llama), no credit card required.
-// Two steps instead of Gemini's one:
-//   1. Whisper transcribes the recording audio -> text
-//   2. Llama reads the transcript and classifies it -> QA result
-// Requires GROQ_API_KEY in the environment.
-//
-// Ringba's recording URLs (recording-public?v=v1&k=...) have no file
-// extension at all, so the real audio format is detected from the HTTP
-// response's Content-Type header instead of guessing from the URL.
+// Uses Hugging Face Serverless Inference API instead of Groq.
+// Requires HF_TOKEN in the environment variables.
 // ---------------------------------------------------------------------------
 
 const VALID_RESULTS: QAResult[] = [
@@ -32,18 +22,14 @@ export interface QAClassification {
   transcript: string;
 }
 
-const MAX_AUDIO_BYTES = 24 * 1024 * 1024; // Groq's free-tier upload cap is 25MB
-const WHISPER_MODEL = "whisper-large-v3-turbo"; // fast + free; use "whisper-large-v3" for max accuracy
-const LLAMA_MODEL = "llama-3.3-70b-versatile";
+const MAX_AUDIO_BYTES = 24 * 1024 * 1024; // Hugging Face / Serverless size limit
+const WHISPER_MODEL = "openai/whisper-large-v3-turbo";
+const LLAMA_MODEL = "meta-llama/Llama-3.3-70B-Instruct";
 
 const SUPPORTED_EXTENSIONS = new Set([
   "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "opus", "wav", "webm"
 ]);
 
-// Maps a Content-Type header to a Groq-supported file extension. This is
-// the reliable path for URLs like Ringba's recording-public endpoint, which
-// have no file extension in the URL itself — only the actual HTTP response
-// headers tell us the real format.
 function extensionFromContentType(contentType: string | null): string | null {
   if (!contentType) return null;
   const type = contentType.split(";")[0].trim().toLowerCase();
@@ -64,9 +50,6 @@ function extensionFromContentType(contentType: string | null): string | null {
   return map[type] || null;
 }
 
-// Fallback for when Content-Type is missing/unhelpful: try the URL's own
-// extension, then finally default to mp3 (the most common call-recording
-// format) rather than sending something Groq will reject outright.
 function guessFileExtension(url: string, contentType: string | null): string {
   const fromHeader = extensionFromContentType(contentType);
   if (fromHeader) return fromHeader;
@@ -112,28 +95,26 @@ async function fetchAudioBuffer(url: string): Promise<{ buffer: Buffer; mimeType
   return { buffer, mimeType, ext };
 }
 
-async function transcribeWithGroq(buffer: Buffer, mimeType: string, ext: string, apiKey: string): Promise<string> {
-  const form = new FormData();
-  form.append("file", new Blob([buffer], { type: mimeType }), `recording.${ext}`);
-  form.append("model", WHISPER_MODEL);
-  form.append("response_format", "json");
-
-  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+async function transcribeWithHuggingFace(buffer: Buffer, mimeType: string, apiKey: string): Promise<string> {
+  const res = await fetch(`https://api-inference.huggingface.co/models/${WHISPER_MODEL}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": mimeType
+    },
+    body: buffer
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Groq transcription failed: ${errText}`);
+    throw new Error(`Hugging Face transcription failed: ${errText}`);
   }
 
   const data = await res.json();
-  return data.text || "";
+  return data.text || (typeof data === "string" ? data : "") || "";
 }
 
-async function classifyTranscriptWithGroq(
+async function classifyTranscriptWithHuggingFace(
   transcript: string,
   call: CallRecord,
   apiKey: string
@@ -162,7 +143,7 @@ ${transcript || "(empty or inaudible)"}
 Respond with ONLY minified JSON, no markdown, no code fences, in exactly this shape:
 {"result":"<one of the categories above>","reason":"<one sentence reason>","score":<integer 0-100 call quality score>}`;
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("https://api-inference.huggingface.co/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -171,13 +152,14 @@ Respond with ONLY minified JSON, no markdown, no code fences, in exactly this sh
     body: JSON.stringify({
       model: LLAMA_MODEL,
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.2
+      temperature: 0.2,
+      max_tokens: 300
     })
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Groq classification failed: ${errText}`);
+    throw new Error(`Hugging Face classification failed: ${errText}`);
   }
 
   const data = await res.json();
@@ -195,13 +177,13 @@ Respond with ONLY minified JSON, no markdown, no code fences, in exactly this sh
 }
 
 /**
- * Classifies a single call: Whisper transcribes the recording, then Llama
- * reads the transcript and classifies it. Requires GROQ_API_KEY.
+ * Classifies a single call using Hugging Face (Whisper for audio + Llama for text classification).
+ * Requires HF_TOKEN in your environment variables.
  */
 export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassification> {
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = process.env.HF_TOKEN;
   if (!apiKey) {
-    throw new Error("GROQ_API_KEY is not set. Add it to your environment variables.");
+    throw new Error("HF_TOKEN is not set. Add your Hugging Face access token to your environment variables.");
   }
 
   const hasRecording =
@@ -220,12 +202,12 @@ export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassi
 
   let transcript = "";
   try {
-    transcript = await transcribeWithGroq(audio.buffer, audio.mimeType, audio.ext, apiKey);
+    transcript = await transcribeWithHuggingFace(audio.buffer, audio.mimeType, apiKey);
   } catch (e: any) {
     return { result: "SHORT CALL", reason: e.message || "Transcription failed.", score: 0, transcript: "" };
   }
 
-  const classification = await classifyTranscriptWithGroq(transcript, call, apiKey);
+  const classification = await classifyTranscriptWithHuggingFace(transcript, call, apiKey);
 
   return {
     ...classification,
