@@ -121,7 +121,9 @@ export default function AdminDashboard() {
 
   // Runs short calls (<=40s) via /api/classify first (fast, batched), then
   // long calls (>40s) via /api/classify-long (slow, one at a time so each
-  // gets the full time budget). Both loop until nothing is left.
+  // gets the full time budget). Syncs to Google Sheets ONCE at the very end
+  // instead of after every batch, to stay well under the Sheets API's
+  // per-minute quota.
   const onClassify = async () => {
     setClassifying(true);
     setMessage("");
@@ -154,6 +156,13 @@ export default function AdminDashboard() {
         setClassifying(false);
         loadCalls();
         return;
+      }
+
+      setMessage("Syncing results to Google Sheets...");
+      try {
+        await fetch("/api/sync", { method: "POST" });
+      } catch {
+        // Non-fatal — classification already succeeded and is saved in the store.
       }
 
       setMessage(
