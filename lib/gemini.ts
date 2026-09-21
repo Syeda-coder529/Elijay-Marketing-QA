@@ -1,5 +1,15 @@
-import { GoogleGenAI, createUserContent, createPartFromBase64 } from "@google/genai";
 import { CallRecord, QAResult } from "./types";
+
+// ---------------------------------------------------------------------------
+// Switched from Gemini to Groq (free tier) — Gemini's free daily quota for
+// gemini-3.6-flash was only 20 requests/day, nowhere near enough for a batch
+// of 90+ calls. Groq's free tier gives ~2,000 audio transcriptions/day
+// (Whisper) and ~14,400 text requests/day (Llama), with no credit card
+// required. This does the job in two steps instead of Gemini's one:
+//   1. Whisper transcribes the recording audio -> text
+//   2. Llama reads the transcript and classifies it -> QA result
+// Requires GROQ_API_KEY in the environment.
+// ---------------------------------------------------------------------------
 
 const VALID_RESULTS: QAResult[] = [
   "SALE",
@@ -18,14 +28,9 @@ export interface QAClassification {
   transcript: string;
 }
 
-// Gemini can listen to audio directly, so QA doesn't need a pre-made text
-// transcript column — it downloads the call recording from `Recording` and
-// transcribes + classifies it in one request. Inline audio like this is
-// capped by Gemini's request size limit; a very long recording (roughly a
-// 30+ minute call at typical compressed bitrates) may exceed it. If you
-// start hitting size errors on longer calls, switch to the Gemini Files API
-// (ai.files.upload) instead of inline data.
-const MAX_INLINE_BYTES = 19 * 1024 * 1024; // stay under Gemini's ~20MB request cap
+const MAX_AUDIO_BYTES = 24 * 1024 * 1024; // Groq's free-tier upload cap is 25MB
+const WHISPER_MODEL = "whisper-large-v3-turbo"; // fast + free; use "whisper-large-v3" for max accuracy
+const LLAMA_MODEL = "llama-3.3-70b-versatile";
 
 function guessMimeType(url: string, contentType: string | null): string {
   if (contentType && contentType.startsWith("audio/")) return contentType;
@@ -48,63 +53,53 @@ function guessMimeType(url: string, contentType: string | null): string {
   }
 }
 
-async function fetchAudioAsBase64(url: string): Promise<{ data: string; mimeType: string } | null> {
+async function fetchAudioBuffer(url: string): Promise<{ buffer: Buffer; mimeType: string; ext: string }> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Could not download recording (HTTP ${res.status}).`);
 
   const contentLength = res.headers.get("content-length");
-  if (contentLength && Number(contentLength) > MAX_INLINE_BYTES) {
-    throw new Error("Recording file is too large for inline AI review (over ~19MB).");
+  if (contentLength && Number(contentLength) > MAX_AUDIO_BYTES) {
+    throw new Error("Recording file is too large for AI review (over ~24MB).");
   }
 
   const buffer = Buffer.from(await res.arrayBuffer());
-  if (buffer.byteLength > MAX_INLINE_BYTES) {
-    throw new Error("Recording file is too large for inline AI review (over ~19MB).");
+  if (buffer.byteLength > MAX_AUDIO_BYTES) {
+    throw new Error("Recording file is too large for AI review (over ~24MB).");
   }
 
-  return {
-    data: buffer.toString("base64"),
-    mimeType: guessMimeType(url, res.headers.get("content-type"))
-  };
+  const mimeType = guessMimeType(url, res.headers.get("content-type"));
+  const ext = url.split("?")[0].split(".").pop()?.toLowerCase() || "mp3";
+  return { buffer, mimeType, ext };
 }
 
-// gemini-2.5-flash was retired for new users in 2026 — gemini-3.6-flash is
-// the current stable Flash-tier model as of this writing. Google's model
-// lineup changes often; if this ever starts returning a "model not found"
-// error, check https://ai.google.dev/gemini-api/docs/models for the current
-// recommended replacement and swap the string below.
-const MODEL_NAME = "gemini-2.5-flash-lite";
+async function transcribeWithGroq(buffer: Buffer, mimeType: string, ext: string, apiKey: string): Promise<string> {
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: mimeType }), `recording.${ext}`);
+  form.append("model", WHISPER_MODEL);
+  form.append("response_format", "json");
 
-/**
- * Classifies a single call by having Gemini listen to its recording
- * directly (transcription + classification in one pass).
- * Requires GEMINI_API_KEY to be set in the environment.
- */
-export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassification> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not set. Add it to your environment variables.");
+  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
+    throw new Error(`Groq transcription failed: ${errText}`);
   }
 
-  const hasRecording =
-    call.recording && call.recording.trim().length > 0 && call.hasRecording?.toLowerCase() !== "no";
+  const data = await res.json();
+  return data.text || "";
+}
 
-  if (!hasRecording) {
-    return { result: "SHORT CALL", reason: "No recording available to review.", score: 0, transcript: "" };
-  }
-
-  let audio: { data: string; mimeType: string };
-  try {
-    audio = await fetchAudioAsBase64(call.recording);
-  } catch (e: any) {
-    return { result: "SHORT CALL", reason: e.message || "Could not load recording.", score: 0, transcript: "" };
-  }
-
-  const ai = new GoogleGenAI({ apiKey });
-
+async function classifyTranscriptWithGroq(
+  transcript: string,
+  call: CallRecord,
+  apiKey: string
+): Promise<Omit<QAClassification, "transcript">> {
   const prompt = `You are a strict call-center QA analyst for a pay-per-call marketing company.
-Listen to the attached call recording. First transcribe it (best effort — it's fine to note
-[inaudible] for unclear parts), then classify the call into EXACTLY ONE of these categories:
+Read the call transcript below and classify the call into EXACTLY ONE of these categories:
 SALE, CALLBACK, NOT INTERESTED, WRONG INTENT, CUSTOMER MISBEHAVE, AGENT MISTAKE, SHORT CALL
 
 Definitions:
@@ -114,36 +109,86 @@ Definitions:
 - WRONG INTENT: the caller wanted something unrelated to the campaign.
 - CUSTOMER MISBEHAVE: the customer was abusive, hostile, or the call was a prank.
 - AGENT MISTAKE: the agent mishandled the call, gave wrong info, or broke script/compliance.
-- SHORT CALL: the call was too short/silent to determine an outcome.
+- SHORT CALL: the call was too short/silent/empty to determine an outcome.
 
 Campaign: ${call.campaign || "unknown"}
 Duration: ${call.duration || "unknown"}
 
-Respond with ONLY minified JSON, no markdown, no code fences, in exactly this shape:
-{"transcript":"<the transcript you produced>","result":"<one of the categories above>","reason":"<one sentence reason>","score":<integer 0-100 call quality score>}`;
+Transcript:
+"""
+${transcript || "(empty or inaudible)"}
+"""
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: createUserContent([
-      createPartFromBase64(audio.data, audio.mimeType),
-      prompt
-    ])
+Respond with ONLY minified JSON, no markdown, no code fences, in exactly this shape:
+{"result":"<one of the categories above>","reason":"<one sentence reason>","score":<integer 0-100 call quality score>}`;
+
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: LLAMA_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2
+    })
   });
 
-  const text = (response.text || "").trim();
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
+    throw new Error(`Groq classification failed: ${errText}`);
+  }
+
+  const data = await res.json();
+  const text = (data.choices?.[0]?.message?.content || "").trim();
   const cleaned = text.replace(/```json|```/g, "").trim();
 
   try {
     const parsed = JSON.parse(cleaned);
     const result: QAResult = VALID_RESULTS.includes(parsed.result) ? parsed.result : "SHORT CALL";
     const score = Math.max(0, Math.min(100, Number(parsed.score) || 0));
-    return {
-      result,
-      reason: String(parsed.reason || "").slice(0, 500),
-      score,
-      transcript: String(parsed.transcript || "").slice(0, 8000)
-    };
+    return { result, reason: String(parsed.reason || "").slice(0, 500), score };
   } catch {
-    return { result: "SHORT CALL", reason: "Could not parse AI response.", score: 0, transcript: "" };
+    return { result: "SHORT CALL", reason: "Could not parse AI response.", score: 0 };
   }
+}
+
+/**
+ * Classifies a single call: Whisper transcribes the recording, then Llama
+ * reads the transcript and classifies it. Requires GROQ_API_KEY.
+ */
+export async function classifyCallWithGemini(call: CallRecord): Promise<QAClassification> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY is not set. Add it to your environment variables.");
+  }
+
+  const hasRecording =
+    call.recording && call.recording.trim().length > 0 && call.hasRecording?.toLowerCase() !== "no";
+
+  if (!hasRecording) {
+    return { result: "SHORT CALL", reason: "No recording available to review.", score: 0, transcript: "" };
+  }
+
+  let audio: { buffer: Buffer; mimeType: string; ext: string };
+  try {
+    audio = await fetchAudioBuffer(call.recording);
+  } catch (e: any) {
+    return { result: "SHORT CALL", reason: e.message || "Could not load recording.", score: 0, transcript: "" };
+  }
+
+  let transcript = "";
+  try {
+    transcript = await transcribeWithGroq(audio.buffer, audio.mimeType, audio.ext, apiKey);
+  } catch (e: any) {
+    return { result: "SHORT CALL", reason: e.message || "Transcription failed.", score: 0, transcript: "" };
+  }
+
+  const classification = await classifyTranscriptWithGroq(transcript, call, apiKey);
+
+  return {
+    ...classification,
+    transcript: transcript.slice(0, 8000)
+  };
 }
