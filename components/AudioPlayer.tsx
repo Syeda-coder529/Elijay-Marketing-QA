@@ -9,10 +9,12 @@ export default function AudioPlayer({ src }: { src: string }) {
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [mounted, setMounted] = useState(false); // audio tag sirf pehle interaction ke baad banega
 
   const bars = Array.from({ length: 28 });
 
   useEffect(() => {
+    if (!mounted) return;
     const audio = audioRef.current;
     if (!audio) return;
     const onTime = () => setProgress(audio.currentTime);
@@ -26,9 +28,23 @@ export default function AudioPlayer({ src }: { src: string }) {
       audio.removeEventListener("loadedmetadata", onLoaded);
       audio.removeEventListener("ended", onEnd);
     };
-  }, [src]);
+  }, [src, mounted]);
 
   const toggle = () => {
+    // Pehli baar click par hi <audio> element mount hoga
+    if (!mounted) {
+      setMounted(true);
+      // element abhi DOM mein nahi hai, is render cycle ke baad play karein
+      requestAnimationFrame(() => {
+        const audio = audioRef.current;
+        if (audio) {
+          audio.play();
+          setPlaying(true);
+        }
+      });
+      return;
+    }
+
     const audio = audioRef.current;
     if (!audio) return;
     if (playing) audio.pause();
@@ -49,7 +65,7 @@ export default function AudioPlayer({ src }: { src: string }) {
 
   return (
     <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
-      <audio ref={audioRef} src={src} preload="metadata" />
+      {mounted && <audio ref={audioRef} src={src} preload="none" />}
       <button
         onClick={toggle}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-purple-500 to-teal-400 text-white shadow-md transition hover:scale-105"
