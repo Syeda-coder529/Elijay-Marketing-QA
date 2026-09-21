@@ -73,47 +73,92 @@ export default function AdminDashboard() {
     if (fileRef.current) fileRef.current.value = "";
   };
 
-  // Runs /api/classify repeatedly until every PENDING call has been
-  // classified. Each request only handles a bounded batch server-side (to
-  // stay inside serverless time limits), so this loop is what makes one
-  // click actually cover *all* calls instead of just the first batch.
-  const onClassify = async () => {
-    setClassifying(true);
-    setMessage("");
+  // Repeatedly calls a given classify endpoint until every eligible call has
+  // been processed (remaining === 0) or nothing more got processed. Each
+  // request only handles a bounded batch (or a single call, for the long-call
+  // route) server-side to stay inside serverless time limits, so this loop is
+  // what makes one click actually cover *all* calls, short or long.
+  const runClassifyLoop = async (
+    endpoint: string,
+    onProgress: (totalProcessed: number) => void
+  ): Promise<{ ok: boolean; totalProcessed: number; error?: string }> => {
     let totalProcessed = 0;
     let safety = 0; // hard stop in case something is stuck, so we never loop forever
 
-    try {
-      while (safety < 100) {
-        safety += 1;
-        const res = await fetch("/api/classify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}"
-        });
+    while (safety < 200) {
+      safety += 1;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
 
-        let data: any;
-        try {
-          data = await res.json();
-        } catch {
-          setMessage(`Request failed (status ${res.status}). Check Vercel function logs for /api/classify.`);
-          break;
-        }
-
-        if (!data.ok) {
-          setMessage(data.error || `Classification failed (status ${res.status}).`);
-          break;
-        }
-
-        totalProcessed += data.processed;
-        setMessage(`AI QA in progress... ${totalProcessed} call(s) processed so far.`);
-        loadCalls();
-
-        if (data.remaining === 0 || data.processed === 0) {
-          setMessage(`AI QA complete — ${totalProcessed} call(s) classified.`);
-          break;
-        }
+      let data: any;
+      try {
+        data = await res.json();
+      } catch {
+        return {
+          ok: false,
+          totalProcessed,
+          error: `Request failed (status ${res.status}). Check Vercel function logs for ${endpoint}.`
+        };
       }
+
+      if (!data.ok) {
+        return { ok: false, totalProcessed, error: data.error || `Classification failed (status ${res.status}).` };
+      }
+
+      totalProcessed += data.processed;
+      onProgress(totalProcessed);
+
+      if (data.remaining === 0 || data.processed === 0) {
+        return { ok: true, totalProcessed };
+      }
+    }
+
+    return { ok: true, totalProcessed };
+  };
+
+  // Runs short calls (<=40s) via /api/classify first (fast, batched), then
+  // long calls (>40s) via /api/classify-long (slow, one at a time so each
+  // gets the full time budget). Both loop until nothing is left.
+  const onClassify = async () => {
+    setClassifying(true);
+    setMessage("");
+
+    try {
+      setMessage("AI QA in progress... processing short calls.");
+      const shortResult = await runClassifyLoop("/api/classify", (n) => {
+        setMessage(`AI QA in progress... ${n} short call(s) processed so far.`);
+        loadCalls();
+      });
+
+      if (!shortResult.ok) {
+        setMessage(shortResult.error || "Short-call classification failed.");
+        setClassifying(false);
+        loadCalls();
+        return;
+      }
+
+      setMessage(
+        `Short calls done (${shortResult.totalProcessed}). Now processing long calls one at a time...`
+      );
+
+      const longResult = await runClassifyLoop("/api/classify-long", (n) => {
+        setMessage(`AI QA in progress... ${n} long call(s) processed so far.`);
+        loadCalls();
+      });
+
+      if (!longResult.ok) {
+        setMessage(longResult.error || "Long-call classification failed.");
+        setClassifying(false);
+        loadCalls();
+        return;
+      }
+
+      setMessage(
+        `AI QA complete — ${shortResult.totalProcessed} short call(s) + ${longResult.totalProcessed} long call(s) classified.`
+      );
     } catch (e: any) {
       setMessage(e?.message || "Classification failed — check your network connection.");
     }
