@@ -3,12 +3,20 @@ import { getSession } from "@/lib/session";
 import { readAllCalls, updateCall } from "@/lib/store";
 import { classifyCallWithGemini } from "@/lib/gemini";
 import { syncCallsToSheets } from "@/lib/sheets";
+import { parseDurationToSeconds } from "@/lib/duration";
 import type { CallRecord } from "@/lib/types";
 
+// Long calls need the full time budget for a single call — Vercel Hobby
+// allows up to 300s (2026 limits), so we use nearly all of it here since
+// only ONE call is processed per invocation.
 export const maxDuration = 300;
 
+// Calls at or under this are handled by the fast /api/classify route instead.
 const MAX_CALL_DURATION_SECONDS = 40;
-const PER_CALL_TIMEOUT_MS = 280000;
+
+// Leave a small safety margin below maxDuration so we always get a chance
+// to write the result + respond before Vercel kills the function.
+const PER_CALL_TIMEOUT_MS = 280000; // 280s
 
 function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
   return Promise.race([
@@ -19,6 +27,9 @@ function classifyWithTimeout(call: CallRecord, ms = PER_CALL_TIMEOUT_MS) {
   ]);
 }
 
+// Classifies ONE long (>40s) PENDING call per invocation. Admin-only.
+// The dashboard loops this endpoint (like it already loops /api/classify)
+// until `remaining` is 0.
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session || session.role !== "admin") {
@@ -34,10 +45,12 @@ export async function POST(req: NextRequest) {
     ? all.filter((c) => c.id === singleId)
     : all.filter((c) => c.qaResult === "PENDING");
 
+  // Only long calls here — the ones the fast route skips.
   const targets = singleId
     ? pending
-    : pending.filter((c) => (c.duration ?? 0) > MAX_CALL_DURATION_SECONDS);
+    : pending.filter((c) => parseDurationToSeconds(c.duration) > MAX_CALL_DURATION_SECONDS);
 
+  // Always exactly one at a time for long calls.
   const call = targets[0];
 
   if (!call) {
